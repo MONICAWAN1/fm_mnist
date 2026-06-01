@@ -1,0 +1,46 @@
+# Local agent/editor state
+.claude/
+.codex/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python caches/build products
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Environments
+.env
+.venv/
+venv/
+env/
+
+# Experiment artifacts
+data/
+output/
+outputs/
+wandb/
+runs/
+checkpoints/
+logs/
+*.pt
+*.pth
+*.ckpt
+
+# Archives / large local bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Reference repos are external sources; keep clone instructions in docs instead.
+references/
