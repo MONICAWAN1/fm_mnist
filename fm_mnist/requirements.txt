@@ -6,3 +6,4 @@ scikit-learn>=1.4
 tqdm>=4.66
 wandb>=0.17
 pillow>=10
+torchcfm>=1.0.7

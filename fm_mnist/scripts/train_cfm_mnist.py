@@ -34,11 +34,11 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def save_image_grid(path: Path, target: torch.Tensor, generated: torch.Tensor) -> None:
+def save_image_grid(path: Path, generated: torch.Tensor) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    images = torch.cat([target, generated], dim=0).detach().cpu()
+    images = generated.detach().cpu()
     images = images.clamp(-1, 1) * 0.5 + 0.5
-    grid = make_grid(images, nrow=target.shape[0])
+    grid = make_grid(images, nrow=generated.shape[0])
     save_image(grid, path)
 
 
@@ -102,10 +102,10 @@ def main() -> None:
 
     model.eval()
     prior = sample_prior(args.sample_n, shape=(1, 28, 28), device=device)
-    target, _ = next_batch()
-    target = target[: args.sample_n].to(device)
+    # target, _ = next_batch()
+    # target = target[: args.sample_n].to(device)
     generated = midpoint_sample(model, prior.clone(), steps=args.sample_steps)
-    save_image_grid(out / "cfm_samples.png", target, generated)
+    save_image_grid(out / "cfm_samples.png", generated=generated)
     torch.save(model.state_dict(), out / "velocity_mlp.pt")
     if wandb_run is not None:
         wandb_run.finish()

@@ -44,3 +44,4 @@ logs/
 
 # Reference repos are external sources; keep clone instructions in docs instead.
 references/
+fm_mnist/docs/
