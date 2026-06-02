@@ -44,4 +44,6 @@ logs/
 
 # Reference repos are external sources; keep clone instructions in docs instead.
 references/
-fm_mnist/docs/
+
+# Local planning docs — not part of the published repo.
+docs/
