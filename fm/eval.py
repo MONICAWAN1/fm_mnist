@@ -263,10 +263,12 @@ def run_evaluation(
     distributional distances are computed directly here, in the SAME space and the
     SAME way as torchcfm (`wasserstein` -> exact EMD with Euclidean cost; W1 and W2;
     plus a mixture-RBF MMD). `real_counts`/`gen_counts` are those coords inverted to
-    gene counts, used only for the gene-level diagnostics in `save_eval_figures`.
-    `labels` (per-real-cell cell type) colours a UMAP of the PCA coords; pass None
-    to skip it.
+    gene counts, used for the gene-level diagnostics AND the UMAP (which is built in
+    gene space, not the whitened-PCA space). `labels` (per-real-cell cell type)
+    colours the UMAP; pass None to skip it.
     """
+    import scanpy as sc
+
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -279,6 +281,13 @@ def run_evaluation(
     metrics["eval/mmd2"] = mmd2_rbf(real_coords, gen_coords, seed=seed)
 
     if labels is not None:
-        umap_overlay(out, real_coords, gen_coords, labels, seed=seed)
+        # UMAP in GENE space, not the model's whitened-PCA space: per-PC whitening
+        # flattens the cell-type structure. Embed from log1p gene counts via PCA-50
+        # (the standard scanpy UMAP input) so the class clusters match prior versions.
+        real_l = sc.pp.log1p(real_counts, copy=True)
+        gen_l = sc.pp.log1p(gen_counts, copy=True)
+        k = min(50, real_l.shape[1], max(real_l.shape[0] - 1, 1))
+        pca = PCA(n_components=k, random_state=seed).fit(real_l)
+        umap_overlay(out, pca.transform(real_l), pca.transform(gen_l), labels, seed=seed)
 
     return metrics
