@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from fm.data import sample_prior, load_spatial_expression
+from fm.data import sample_prior, load_spatial_pca
 from fm.flow_matching import conditional_flow_matching_loss, ot_conditional_flow_matching_loss
 from fm.interpolants import Interpolant
 from fm.networks import VelocityMLP
@@ -29,14 +29,15 @@ from fm.networks import VelocityMLP
 # control the CLI is free to change.
 _RESUMABLE_CONFIG = (
     "data", "dim", "hidden", "batch", "lr", "interpolant",
-    "coupling", "ot_method", "test_frac", "target_sum", "no_standardize", "seed",
+    "coupling", "ot_method", "test_frac", "target_sum", "n_pcs", "seed",
 )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train OT-CFM over spatial expression (with checkpointing).")
     p.add_argument("--data", type=str, default="data/adata_Zhuang_Zhuang-ABCA-1.001.h5ad")
-    p.add_argument("--dim", type=int, default=1122, help="auto-corrected to the gene count of --data")
+    p.add_argument("--dim", type=int, default=0, help="model dim; set automatically to --n_pcs")
+    p.add_argument("--n_pcs", type=int, default=100, help="PCA components (torchcfm paper uses 100)")
     p.add_argument("--hidden", type=int, default=512)
     p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--batch", type=int, default=256)
@@ -46,7 +47,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ot_method", choices=["exact", "hungarian"], default="exact")
     p.add_argument("--test_frac", type=float, default=0.1)
     p.add_argument("--target_sum", type=float, default=None)
-    p.add_argument("--no_standardize", action="store_true")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="outputs/cfm_spatial")
     p.add_argument("--save_every", type=int, default=2000, help="checkpoint every N steps (0 -> only final)")
@@ -103,22 +103,20 @@ def main() -> None:
             ) from exc
         wandb_run = wandb.init(project="fm-spatial", config=vars(args) | {"device": str(device)})
 
-    train_loader, x_test, stats = load_spatial_expression(
+    train_loader, x_test, stats = load_spatial_pca(
         args.data,
         batch_size=args.batch,
+        n_pcs=args.n_pcs,
         target_sum=args.target_sum,
-        standardize=not args.no_standardize,
         test_frac=args.test_frac,
         seed=args.seed,
     )
-    # keep the model dim in lock-step with the data's gene count
-    genes = x_test.shape[1]
-    if args.dim != genes:
-        if resume_state is not None:
-            raise ValueError(f"checkpoint dim={args.dim} != data genes={genes}; data/config mismatch")
-        print(f"note: --dim {args.dim} != gene count {genes}; using {genes}")
-        args.dim = genes
-    print(f"train batches/epoch={len(train_loader)}  test cells={x_test.shape[0]}  genes={args.dim}")
+    # model dim = whitened-PCA dimensionality (n_pcs, capped by data)
+    pca_dim = x_test.shape[1]
+    if resume_state is not None and args.dim != pca_dim:
+        raise ValueError(f"checkpoint dim={args.dim} != PCA dim={pca_dim}; data/config mismatch")
+    args.dim = pca_dim
+    print(f"train batches/epoch={len(train_loader)}  test cells={x_test.shape[0]}  PCA dim={args.dim}")
 
     model = VelocityMLP(dim=args.dim, hidden=args.hidden).to(device)
     interpolant = Interpolant(args.interpolant)

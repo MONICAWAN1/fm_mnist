@@ -14,79 +14,132 @@ from sklearn.decomposition import PCA
 def mmd2_rbf(
     x: np.ndarray,
     y: np.ndarray,
+    sigma_list: tuple[float, ...] | None = None,
     bandwidth_mults: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0),
+    biased: bool = False,
     max_n: int = 2000,
     seed: int = 0,
 ) -> float:
-    """Unbiased squared MMD between two sample sets under a mixture of RBF kernels.
+    """Mixture-of-RBF squared MMD between two sample sets.
 
-    MMD is a kernel two-sample distance: ~0 iff the two empirical distributions
-    match (in the RKHS), with NO per-row pairing — it compares the clouds, which
-    is exactly the generated-vs-real-test question. The mixture kernel
-    k = sum_s exp(-||a-b||^2 / (2 * sigma^2 * mult_s)) with sigma^2 set by the
-    median heuristic avoids picking a single bandwidth. The unbiased U-statistic
-    drops the kernel-matrix diagonal, so it can be slightly negative when the two
-    distributions are identical (sampling noise) — that is expected, do not clip.
+    Mirrors torchcfm's `mix_rbf_mmd2` / `_mix_rbf_kernel` / `_mmd2`
+    (references/conditional-flow-matching/runner/src/models/components/mmd.py):
+    pool X and Y, build the full Gram matrix, sum an RBF kernel over several
+    bandwidths, and form MMD^2 from the XX / YY / XY blocks. RBF is the
+    *characteristic*-kernel variant; unlike their `linear_mmd2` (difference in
+    means only) or `poly_mmd2` (low-order moments via a crude consecutive-pair
+    estimator), it detects ANY distributional difference between the two clouds —
+    no per-row pairing — which is exactly the generated-vs-real-test question.
 
-    Both sets are subsampled to `max_n` rows to keep the O(n^2) kernel matrices
-    tractable; `seed` makes that subsample reproducible.
+    Cherry-picked for gene expression on this data:
+      * bandwidth: median heuristic (sigma^2 = median pairwise sq-distance * mult,
+        summed over `bandwidth_mults`) instead of their FIXED sigma_list=[0.01..100],
+        which was tuned to their data scale and would mostly saturate/vanish on our
+        log1p / PCA distances. Pass an explicit `sigma_list` to override it.
+      * estimator: `biased=False` (unbiased U-statistic, diagonal dropped) by
+        default — at our modest sample size (~589 cells) the biased V-statistic's
+        diagonal term inflates MMD^2 by ~d/m. The unbiased value can dip slightly
+        negative when the distributions match; that is expected, do not clip. Set
+        `biased=True` to mirror their default (non-negative, lower variance — nicer
+        for a per-step training curve).
+
+    Generalises their equal-size assumption to allow n != m. Both sets are
+    subsampled to `max_n` rows (seeded) for tractable O(n^2) Gram matrices.
     """
+    import torch
+
     rng = np.random.default_rng(seed)
     if x.shape[0] > max_n:
         x = x[rng.choice(x.shape[0], max_n, replace=False)]
     if y.shape[0] > max_n:
         y = y[rng.choice(y.shape[0], max_n, replace=False)]
 
-    def sqdist(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        d2 = (a**2).sum(1)[:, None] + (b**2).sum(1)[None, :] - 2.0 * (a @ b.T)
-        return np.maximum(d2, 0.0)  # clamp tiny negatives from float error
+    X = torch.as_tensor(x, dtype=torch.float32)
+    Y = torch.as_tensor(y, dtype=torch.float32)
+    n, m = X.shape[0], Y.shape[0]
 
-    dxx, dyy, dxy = sqdist(x, x), sqdist(y, y), sqdist(x, y)
-    # median heuristic on the pooled off-diagonal squared distances
-    med = float(np.median(np.concatenate([
-        dxx[np.triu_indices_from(dxx, k=1)],
-        dyy[np.triu_indices_from(dyy, k=1)],
-        dxy.ravel(),
-    ])))
-    med = med if med > 0 else 1.0
-    n, m = x.shape[0], y.shape[0]
+    # pooled Gram -> squared distances (their _mix_rbf_kernel trick)
+    Z = torch.cat((X, Y), dim=0)
+    ZZT = Z @ Z.t()
+    diag = torch.diag(ZZT).unsqueeze(1)
+    d2 = (diag - 2.0 * ZZT + diag.t()).clamp_min(0.0)  # ||z_i - z_j||^2
 
-    total = 0.0
-    for mult in bandwidth_mults:
-        denom = 2.0 * med * mult
-        kxx, kyy, kxy = np.exp(-dxx / denom), np.exp(-dyy / denom), np.exp(-dxy / denom)
-        np.fill_diagonal(kxx, 0.0)  # unbiased: exclude self-similarity
-        np.fill_diagonal(kyy, 0.0)
-        total += kxx.sum() / (n * (n - 1)) + kyy.sum() / (m * (m - 1)) - 2.0 * kxy.mean()
-    return float(total)
+    if sigma_list is None:
+        off = d2[~torch.eye(n + m, dtype=torch.bool)]  # off-diagonal pairwise sq-dists
+        med = float(off.median())
+        med = med if med > 0 else 1.0
+        sigma2_list = [med * mult for mult in bandwidth_mults]  # sigma^2 per kernel
+    else:
+        sigma2_list = [float(s) ** 2 for s in sigma_list]
+
+    K = torch.zeros_like(d2)
+    for s2 in sigma2_list:
+        K = K + torch.exp(-d2 / (2.0 * s2))  # gamma = 1/(2 sigma^2), kernels summed
+
+    Kxx, Kyy, Kxy = K[:n, :n], K[n:, n:], K[:n, n:]
+    if biased:  # V-statistic: keep the diagonal
+        mmd2 = Kxx.sum() / (n * n) + Kyy.sum() / (m * m) - 2.0 * Kxy.sum() / (n * m)
+    else:  # U-statistic: drop self-similarity on the diagonal
+        sum_xx = Kxx.sum() - torch.diagonal(Kxx).sum()
+        sum_yy = Kyy.sum() - torch.diagonal(Kyy).sum()
+        mmd2 = sum_xx / (n * (n - 1)) + sum_yy / (m * (m - 1)) - 2.0 * Kxy.sum() / (n * m)
+    return float(mmd2)
 
 
 def ot_distance(
     x: np.ndarray,
     y: np.ndarray,
+    method: str | None = "exact",
+    reg: float = 0.05,
+    power: int = 2,
     max_n: int = 4000,
     seed: int = 0,
-) -> tuple[float, float]:
-    """Exact optimal-transport (Wasserstein-2) distance between two sample sets.
+) -> float:
+    """Wasserstein-`power` distance between two sample sets (Euclidean ground cost).
 
-    Uniform marginals, squared-Euclidean ground cost, solved with POT's exact EMD.
-    Returns (W2_squared, W2). Like MMD this is a pairing-free distributional
-    distance, but it is a true metric on distributions (the OT cost the model's
-    OT-CFM coupling approximates at training time). Sets are subsampled to `max_n`
-    rows so the EMD LP stays tractable; `seed` makes that reproducible.
+    Mirrors torchcfm's `wasserstein` helper
+    (references/conditional-flow-matching/torchcfm/optimal_transport.py): uniform
+    marginals, cost M = ||x_i - y_j|| (squared when power==2), solved with POT's
+    exact EMD (`emd2`) or entropic Sinkhorn (`partial(sinkhorn2, reg=reg)`), with a
+    high `numItermax` so the LP/iteration doesn't bail early. For power==2 the sqrt
+    is taken, so the return is the true W2 distance (not W2^2).
+
+    Pairing-free and a true metric on distributions — the OT cost OT-CFM's coupling
+    approximates at training time. Sets are subsampled to `max_n` rows (seeded) so
+    the solve stays tractable in high dimension; the spatial test set (~589 cells)
+    is well under this, so no subsampling happens there.
     """
     import ot as pot
+    import torch
 
+    assert power == 1 or power == 2
     rng = np.random.default_rng(seed)
     if x.shape[0] > max_n:
         x = x[rng.choice(x.shape[0], max_n, replace=False)]
     if y.shape[0] > max_n:
         y = y[rng.choice(y.shape[0], max_n, replace=False)]
-    a = np.ones(x.shape[0]) / x.shape[0]
-    b = np.ones(y.shape[0]) / y.shape[0]
-    M = pot.dist(x, y, metric="sqeuclidean")  # squared-Euclidean ground cost
-    w2_sq = float(pot.emd2(a, b, M))  # exact EMD -> W2^2
-    return w2_sq, float(np.sqrt(max(w2_sq, 0.0)))
+
+    # ot_fn takes (a, b, M): marginals a, b and cost matrix M
+    if method == "exact" or method is None:
+        ot_fn = pot.emd2
+    elif method == "sinkhorn":
+        from functools import partial
+
+        ot_fn = partial(pot.sinkhorn2, reg=reg)
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
+    a, b = pot.unif(x.shape[0]), pot.unif(y.shape[0])
+    M = torch.cdist(
+        torch.as_tensor(x, dtype=torch.float32),
+        torch.as_tensor(y, dtype=torch.float32),
+    )
+    if power == 2:
+        M = M**2
+    ret = ot_fn(a, b, M.cpu().numpy(), numItermax=int(1e7))
+    if power == 2:
+        ret = np.sqrt(ret)
+    return float(ret)
 
 
 def umap_overlay(
@@ -175,58 +228,57 @@ def save_eval_figures(out: Path, real: np.ndarray, gen: np.ndarray) -> dict:
     fig.tight_layout(); fig.savefig(out / "marginal_hists.png", dpi=120); plt.close(fig)
 
     # scalar metrics
+    # R2 measures the difference between generated cell gene expression mean with 
+    # aggregated real cells gene expressoin mean
     def r2(a, b):
         ss_res = float(((a - b) ** 2).sum())
         ss_tot = float(((a - a.mean()) ** 2).sum()) + 1e-12
         return 1.0 - ss_res / ss_tot
 
     cov_r, cov_g = np.cov(real_l, rowvar=False), np.cov(gen_l, rowvar=False)
+    # gene-level diagnostics only; the distributional distances (MMD, Wasserstein)
+    # are computed by run_evaluation in the model's whitened-PCA space, the same
+    # space/way torchcfm scores them.
     metrics = {
         "eval/mean_r2": r2(rm, gm),
         "eval/var_r2": r2(rv, gv),
         "eval/cov_frobenius": float(np.linalg.norm(cov_r - cov_g)),
         "eval/cov_frobenius_rel": float(np.linalg.norm(cov_r - cov_g) / (np.linalg.norm(cov_r) + 1e-12)),
-        # kernel two-sample distance over the full expression vectors (~0 == match)
-        "eval/mmd2_rbf": mmd2_rbf(real_l, gen_l),
     }
     return metrics
 
 
 def run_evaluation(
     out: Path,
+    real_coords: np.ndarray,
+    gen_coords: np.ndarray,
     real_counts: np.ndarray,
     gen_counts: np.ndarray,
     labels=None,
-    n_pcs: int = 50,
     seed: int = 0,
 ) -> dict:
-    """Full evaluation: moment/MMD metrics + figures, plus OT distance and a UMAP.
+    """Full evaluation for the whitened-PCA pipeline.
 
-    `real_counts`/`gen_counts` are count-like (N, G). `labels` is a per-real-cell
-    cell-type series (e.g. the 'class' column) used to colour the UMAP; pass None
-    to skip the UMAP. OT distance and UMAP both operate in a PCA-`n_pcs` space fit
-    on the real test cells (denoises before the high-dim comparison).
+    `real_coords`/`gen_coords` are the model-space (whitened-PCA) arrays — the
+    distributional distances are computed directly here, in the SAME space and the
+    SAME way as torchcfm (`wasserstein` -> exact EMD with Euclidean cost; W1 and W2;
+    plus a mixture-RBF MMD). `real_counts`/`gen_counts` are those coords inverted to
+    gene counts, used only for the gene-level diagnostics in `save_eval_figures`.
+    `labels` (per-real-cell cell type) colours a UMAP of the PCA coords; pass None
+    to skip it.
     """
-    import scanpy as sc
-
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
 
-    # existing moment-based metrics + figures (does its own log1p internally)
+    # gene-level diagnostics (per-gene moments, covariance) + figures
     metrics = save_eval_figures(out, real_counts, gen_counts)
 
-    # shared PCA space for OT + UMAP, fit on real test cells
-    real_l = sc.pp.log1p(real_counts, copy=True)
-    gen_l = sc.pp.log1p(gen_counts, copy=True)
-    k = min(n_pcs, real_l.shape[1], max(real_l.shape[0] - 1, 1))
-    pca = PCA(n_components=k, random_state=seed).fit(real_l)
-    real_p, gen_p = pca.transform(real_l), pca.transform(gen_l)
-
-    w2_sq, w2 = ot_distance(real_p, gen_p, seed=seed)
-    metrics["eval/ot_w2sq_pca"] = w2_sq
-    metrics["eval/ot_w2_pca"] = w2
+    # distributional distances in the model space, exactly as torchcfm scores them
+    metrics["eval/ot_w1"] = ot_distance(real_coords, gen_coords, power=1, seed=seed)
+    metrics["eval/ot_w2"] = ot_distance(real_coords, gen_coords, power=2, seed=seed)
+    metrics["eval/mmd2"] = mmd2_rbf(real_coords, gen_coords, seed=seed)
 
     if labels is not None:
-        umap_overlay(out, real_p, gen_p, labels, seed=seed)
+        umap_overlay(out, real_coords, gen_coords, labels, seed=seed)
 
     return metrics

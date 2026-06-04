@@ -19,7 +19,7 @@ matplotlib.use("Agg")  # headless CLI: render figures to files, no display
 import numpy as np
 import torch
 
-from fm.data import sample_prior, load_spatial_expression, invert_expression
+from fm.data import sample_prior, load_spatial_pca, invert_pca_expression
 from fm.eval import run_evaluation
 from fm.networks import VelocityMLP
 from fm.sampling import midpoint_sample
@@ -34,7 +34,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample_n", type=int, default=0, help="0 -> match #real test cells")
     p.add_argument("--sample_steps", type=int, default=100)
     p.add_argument("--label_key", type=str, default="class", help=".obs column used to colour the UMAP")
-    p.add_argument("--n_pcs", type=int, default=50, help="PCA dims for OT distance + UMAP")
     p.add_argument("--seed", type=int, default=0, help="seed for sampling/subsampling (reproducibility)")
     p.add_argument("--save_adata", action="store_true", help="also write the generated slide as .h5ad")
     p.add_argument("--wandb", action="store_true", help="log metrics + figures to Weights & Biases")
@@ -67,12 +66,13 @@ def main() -> None:
     model.eval()
 
     # recover the SAME held-out test split + cell-type labels the model never saw,
-    # using the checkpoint's data config (deterministic given the seed)
-    _, x_test, stats_reload = load_spatial_expression(
+    # using the checkpoint's data config (deterministic given the seed). This refits
+    # the same whitened-PCA the model trained on (n_pcs from the checkpoint).
+    _, x_test, stats_reload = load_spatial_pca(
         _resolve_data_path(cfg["data"]),
         batch_size=cfg["batch"],
+        n_pcs=cfg["n_pcs"],
         target_sum=cfg["target_sum"],
-        standardize=not cfg["no_standardize"],
         test_frac=cfg["test_frac"],
         seed=cfg["seed"],
         label_keys=[args.label_key],
@@ -80,18 +80,21 @@ def main() -> None:
     labels = stats_reload["test_labels"][args.label_key]
     print(f"test cells={x_test.shape[0]}  cell-type levels ({args.label_key})={labels.nunique()}")
 
-    # generation step: learn a slide from the prior
+    # generation step: transport the prior to the model's whitened-PCA space
     n_gen = args.sample_n if args.sample_n > 0 else x_test.shape[0]
     torch.manual_seed(args.seed)
     prior = sample_prior(n_gen, shape=(cfg["dim"],), device=device)
     gen = midpoint_sample(model, prior.clone(), steps=args.sample_steps)
 
-    # invert with the checkpoint's preprocessing stats (the transform used at train time)
-    gen_counts = invert_expression(gen.cpu().numpy(), stats)
-    real_counts = invert_expression(x_test.numpy(), stats)
+    # model-space coords (whitened PCA) and their inverse to gene counts
+    gen_coords = gen.cpu().numpy()
+    real_coords = x_test.numpy()
+    gen_counts = invert_pca_expression(gen_coords, stats)
+    real_counts = invert_pca_expression(real_coords, stats)
 
-    # run evalutaion metrics + plot figures
-    metrics = run_evaluation(out, real_counts, gen_counts, labels=labels, n_pcs=args.n_pcs, seed=args.seed)
+    # EMD/MMD scored in PCA space (their way); gene metrics from the inverted counts
+    metrics = run_evaluation(out, real_coords, gen_coords, real_counts, gen_counts,
+                             labels=labels, seed=args.seed)
     print("eval:", {k: round(v, 4) for k, v in metrics.items()})
     with open(out / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
