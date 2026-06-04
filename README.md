@@ -1,4 +1,4 @@
-# Chapter 5 Flow Matching Implementations
+# Flow Matching Implementations
 
 This mini-project is meant to be read alongside Chapter 5 of *The Principles of Diffusion Models*.
 It is deliberately small: 2D toy data, PyTorch MLPs, and explicit equations.
