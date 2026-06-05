@@ -142,6 +142,75 @@ def ot_distance(
     return float(ret)
 
 
+def compute_trajectory_distances(
+    pred_list: list[np.ndarray],
+    true_list: list[np.ndarray],
+    leaveout: int = -1,
+    seed: int = 0,
+) -> dict:
+    """Per-transition distribution distances for the EB trajectory task.
+
+    `pred_list[i]` is the model's predicted cloud at timepoint i+1 (obtained by
+    integrating the learned field one unit of global time from the TRUE timepoint-i
+    cells); `true_list[i]` is the real timepoint-(i+1) cloud. We score each
+    transition exactly as torchcfm's `compute_distribution_distances` does — W1 and
+    W2 via the same exact-EMD `wasserstein` (mirrored in `ot_distance`), plus a
+    mixture-RBF MMD — then average over transitions.
+
+    The headline interpolation metric is `t_out/*`: when `leaveout > 0`, the
+    transition i = leaveout-1 predicts the held-out timepoint that training never
+    paired, so its W1 (`t_out/ot_w1`) is the unbiased EMD the paper reports.
+    """
+    metrics = {}
+    w1s, w2s, mmds = [], [], []
+    for i, (a, b) in enumerate(zip(pred_list, true_list)):
+        w1 = ot_distance(a, b, power=1, seed=seed)
+        w2 = ot_distance(a, b, power=2, seed=seed)
+        mmd = mmd2_rbf(a, b, seed=seed)
+        tp = i + 1  # this transition predicts timepoint i+1
+        metrics[f"eval/t{tp}/ot_w1"] = w1
+        metrics[f"eval/t{tp}/ot_w2"] = w2
+        metrics[f"eval/t{tp}/mmd2"] = mmd
+        w1s.append(w1); w2s.append(w2); mmds.append(mmd)
+        if leaveout > 0 and tp == leaveout:
+            metrics["eval/t_out/ot_w1"] = w1  # the interpolation EMD (paper headline)
+            metrics["eval/t_out/ot_w2"] = w2
+            metrics["eval/t_out/mmd2"] = mmd
+    metrics["eval/mean/ot_w1"] = float(np.mean(w1s))
+    metrics["eval/mean/ot_w2"] = float(np.mean(w2s))
+    metrics["eval/mean/mmd2"] = float(np.mean(mmds))
+    return metrics
+
+
+def trajectory_overlay(
+    out: Path,
+    timepoint_data: list[np.ndarray],
+    pred_heldout: np.ndarray | None = None,
+    leaveout: int = -1,
+) -> None:
+    """PC1/PC2 scatter of real cells coloured by timepoint, predicted held-out overlaid.
+
+    Everything is the model-space (whitened PCA) data the EMD is computed in, so the
+    picture is faithful to what the metric sees. `pred_heldout` (model's prediction at
+    the held-out timepoint) is drawn as black x to eyeball the interpolation.
+    """
+    cmap = plt.get_cmap("viridis", max(len(timepoint_data), 1))
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for t, X in enumerate(timepoint_data):
+        tag = f"t{t}" + (" (held out)" if t == leaveout else "")
+        ax.scatter(X[:, 0], X[:, 1], s=6, alpha=0.5, color=cmap(t), label=tag, linewidths=0)
+    if pred_heldout is not None:
+        ax.scatter(pred_heldout[:, 0], pred_heldout[:, 1], s=14, alpha=0.7,
+                   color="black", marker="x", linewidths=0.6,
+                   label=f"predicted t{leaveout}")
+    ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+    ax.set_title("EB trajectory (whitened PCA): real cells by timepoint + prediction")
+    ax.legend(markerscale=2, fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(out / "trajectory_overlay.png", dpi=130)
+    plt.close(fig)
+
+
 def umap_overlay(
     out: Path,
     real_emb: np.ndarray,

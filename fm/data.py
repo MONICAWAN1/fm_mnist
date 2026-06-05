@@ -315,6 +315,96 @@ def load_eb_velocity(
     return train_loader, torch.from_numpy(X_test), stats
 
 
+def load_eb_velocity_trajectory(
+    path: str,
+    n_pcs: int = 5,
+    whiten: bool = True,
+    embed_key: str = "pcs",
+    label_key: str = "sample_labels",
+) -> tuple[list[torch.Tensor], dict]:
+    """Load EB data for the paper's TRAJECTORY task (transport timepoint t -> t+1).
+
+    This is the leave-one-out interpolation benchmark, NOT the noise->data generative
+    fit in `load_eb_velocity`. It reproduces torchcfm's `CustomTrajectoryDataModule`
+    (config `runner/configs/datamodule/time_dist.yaml`):
+
+        pcs[:, :n_pcs]  ->  StandardScaler whiten (fit on ALL cells)  ->  split by timepoint
+
+    Crucially their trajectory config uses `max_dim=5, whiten=True`: the EMD lives in
+    a 5-D whitened PCA space, which is why their reported W1 is ~0.8 rather than the
+    ~11 you get pooling all 100 PCs. The scaler is fit on all cells (as they do,
+    before splitting), which only standardizes per-PC and leaks no cross-timepoint
+    structure.
+
+    `sample_labels` are integer collection timepoints; we return one whitened float32
+    tensor per timepoint, ordered by sorted unique label, so the trajectory loss can
+    pair consecutive timepoints. We keep ALL cells per timepoint (their test loader
+    uses `load_full=True`); the held-out timepoint is never paired during training, so
+    its EMD is the unbiased interpolation metric.
+
+    Returns (timepoint_data, stats):
+      * timepoint_data: list[Tensor] of length T, each (n_cells_t, n_pcs)
+      * stats: sc_mean/sc_scale (un-whiten), n_times, dim, ulabels, and per-timepoint
+        `phate_by_t` (2-D PHATE) + `labels_by_t` for plotting.
+    """
+    from sklearn.preprocessing import StandardScaler
+
+    npz = np.load(path, allow_pickle=True)
+    X = np.asarray(npz[embed_key], dtype=np.float32)
+    labels = np.asarray(npz[label_key])
+    k = int(min(n_pcs, X.shape[1]))
+    X = X[:, :k]
+
+    if whiten:
+        scaler = StandardScaler().fit(X)  # fit on ALL cells, as the paper does
+        Xw = scaler.transform(X).astype(np.float32)
+        sc_mean = scaler.mean_.astype(np.float32)
+        sc_scale = scaler.scale_.astype(np.float32)
+    else:
+        Xw = X
+        sc_mean = np.zeros(k, np.float32)
+        sc_scale = np.ones(k, np.float32)
+
+    ulabels = np.unique(labels)
+    timepoint_data = [torch.from_numpy(Xw[labels == lab].copy()) for lab in ulabels]
+
+    phate = np.asarray(npz["phate"], dtype=np.float32) if "phate" in npz.files else None
+    stats = {
+        "space": "pca",
+        "n_pcs": k,
+        "dim": k,
+        "whiten": whiten,
+        "sc_mean": sc_mean,
+        "sc_scale": sc_scale,
+        "n_times": len(ulabels),
+        "ulabels": [int(u) for u in ulabels],
+        "labels_by_t": [int(u) for u in ulabels],
+        "phate_by_t": (
+            [phate[labels == lab].copy() for lab in ulabels] if phate is not None else None
+        ),
+    }
+    return timepoint_data, stats
+
+
+def sample_eb_batch(
+    timepoint_data: list[torch.Tensor],
+    batch_size: int,
+    device: str | torch.device = "cpu",
+) -> list[torch.Tensor]:
+    """Draw one `batch_size` minibatch (with replacement) from each timepoint.
+
+    Mirrors the torchcfm single-cell notebook's `get_batch`: every timepoint
+    contributes an equally sized minibatch so the trajectory loss can form
+    consecutive (x0, x1) pairs of matching shape regardless of how many cells each
+    timepoint has. Sampling with replacement matches their `np.random.randint`.
+    """
+    out = []
+    for X in timepoint_data:
+        idx = np.random.randint(X.shape[0], size=batch_size)
+        out.append(X[idx].to(device))
+    return out
+
+
 def sample_gaussian_mixture(batch_size: int, device: str | torch.device = "cpu") -> torch.Tensor:
     """A simple multimodal p_data for visualizing transport."""
     centers = torch.tensor(
