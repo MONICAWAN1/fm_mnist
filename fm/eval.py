@@ -252,8 +252,8 @@ def run_evaluation(
     out: Path,
     real_coords: np.ndarray,
     gen_coords: np.ndarray,
-    real_counts: np.ndarray,
-    gen_counts: np.ndarray,
+    real_counts: np.ndarray | None,
+    gen_counts: np.ndarray | None,
     labels=None,
     seed: int = 0,
 ) -> dict:
@@ -264,30 +264,47 @@ def run_evaluation(
     SAME way as torchcfm (`wasserstein` -> exact EMD with Euclidean cost; W1 and W2;
     plus a mixture-RBF MMD). `real_counts`/`gen_counts` are those coords inverted to
     gene counts, used for the gene-level diagnostics AND the UMAP (which is built in
-    gene space, not the whitened-PCA space). `labels` (per-real-cell cell type)
-    colours the UMAP; pass None to skip it.
+    gene space). Pass them as None for a PCA-only dataset (e.g. the EB `.npz`, which
+    ships only a PCA embedding with no recoverable counts): the gene-level
+    diagnostics are skipped and the UMAP is built directly on the PCA coords.
+    `labels` (per-real-cell label, e.g. cell type or collection timepoint) colours
+    the UMAP; pass None to skip it.
     """
     import scanpy as sc
 
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
+    pca_only = real_counts is None or gen_counts is None
 
-    # gene-level diagnostics (per-gene moments, covariance) + figures
-    metrics = save_eval_figures(out, real_counts, gen_counts)
+    # gene-level diagnostics (per-gene moments, covariance) + figures — gene space only
+    metrics = {} if pca_only else save_eval_figures(out, real_counts, gen_counts)
 
     # distributional distances in the model space, exactly as torchcfm scores them
     metrics["eval/ot_w1"] = ot_distance(real_coords, gen_coords, power=1, seed=seed)
     metrics["eval/ot_w2"] = ot_distance(real_coords, gen_coords, power=2, seed=seed)
     metrics["eval/mmd2"] = mmd2_rbf(real_coords, gen_coords, seed=seed)
 
+    if pca_only:
+        # PCA overlay directly in model space (PC1 vs PC2) for a quick visual check
+        fig, ax = plt.subplots(figsize=(5, 5))
+        ax.scatter(real_coords[:, 0], real_coords[:, 1], s=6, alpha=0.5, label="real (test)")
+        ax.scatter(gen_coords[:, 0], gen_coords[:, 1], s=6, alpha=0.5, label="generated")
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2"); ax.legend()
+        ax.set_title("whitened-PCA overlay")
+        fig.tight_layout(); fig.savefig(out / "pca_overlay.png", dpi=120); plt.close(fig)
+
     if labels is not None:
-        # UMAP in GENE space, not the model's whitened-PCA space: per-PC whitening
-        # flattens the cell-type structure. Embed from log1p gene counts via PCA-50
-        # (the standard scanpy UMAP input) so the class clusters match prior versions.
-        real_l = sc.pp.log1p(real_counts, copy=True)
-        gen_l = sc.pp.log1p(gen_counts, copy=True)
-        k = min(50, real_l.shape[1], max(real_l.shape[0] - 1, 1))
-        pca = PCA(n_components=k, random_state=seed).fit(real_l)
-        umap_overlay(out, pca.transform(real_l), pca.transform(gen_l), labels, seed=seed)
+        if pca_only:
+            # already PCA: UMAP directly on the whitened-PCA coords (no gene space).
+            umap_overlay(out, real_coords, gen_coords, labels, seed=seed)
+        else:
+            # UMAP in GENE space, not the model's whitened-PCA space: per-PC whitening
+            # flattens the cell-type structure. Embed from log1p gene counts via PCA-50
+            # (the standard scanpy UMAP input) so the class clusters match prior versions.
+            real_l = sc.pp.log1p(real_counts, copy=True)
+            gen_l = sc.pp.log1p(gen_counts, copy=True)
+            k = min(50, real_l.shape[1], max(real_l.shape[0] - 1, 1))
+            pca = PCA(n_components=k, random_state=seed).fit(real_l)
+            umap_overlay(out, pca.transform(real_l), pca.transform(gen_l), labels, seed=seed)
 
     return metrics

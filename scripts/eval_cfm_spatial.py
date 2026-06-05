@@ -19,7 +19,7 @@ matplotlib.use("Agg")  # headless CLI: render figures to files, no display
 import numpy as np
 import torch
 
-from fm.data import sample_prior, load_spatial_pca, invert_pca_expression
+from fm.data import sample_prior, load_spatial_pca, load_eb_velocity, invert_pca_expression
 from fm.eval import run_evaluation
 from fm.networks import VelocityMLP
 from fm.sampling import midpoint_sample
@@ -65,20 +65,36 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    # recover the SAME held-out test split + cell-type labels the model never saw,
-    # using the checkpoint's data config (deterministic given the seed). This refits
-    # the same whitened-PCA the model trained on (n_pcs from the checkpoint).
-    _, x_test, stats_reload = load_spatial_pca(
-        _resolve_data_path(cfg["data"]),
-        batch_size=cfg["batch"],
-        n_pcs=cfg["n_pcs"],
-        target_sum=cfg["target_sum"],
-        test_frac=cfg["test_frac"],
-        seed=cfg["seed"],
-        label_keys=[args.label_key],
-    )
-    labels = stats_reload["test_labels"][args.label_key]
-    print(f"test cells={x_test.shape[0]}  cell-type levels ({args.label_key})={labels.nunique()}")
+    # recover the SAME held-out test split + labels the model never saw, using the
+    # checkpoint's data config (deterministic given the seed). This refits the same
+    # whitened-PCA the model trained on (n_pcs from the checkpoint).
+    is_eb = cfg["data"].endswith(".npz")
+    if is_eb:
+        # EB ships a PCA embedding only; its label column is the collection
+        # timepoint `sample_labels` (ignore --label_key, which is a gene-space .obs).
+        eb_label_key = "sample_labels"
+        _, x_test, stats_reload = load_eb_velocity(
+            _resolve_data_path(cfg["data"]),
+            batch_size=cfg["batch"],
+            n_pcs=cfg["n_pcs"],
+            test_frac=cfg["test_frac"],
+            seed=cfg["seed"],
+            label_keys=[eb_label_key],
+        )
+        labels = stats_reload["test_labels"][eb_label_key]
+        print(f"test cells={x_test.shape[0]}  timepoint levels ({eb_label_key})={labels.nunique()}")
+    else:
+        _, x_test, stats_reload = load_spatial_pca(
+            _resolve_data_path(cfg["data"]),
+            batch_size=cfg["batch"],
+            n_pcs=cfg["n_pcs"],
+            target_sum=cfg["target_sum"],
+            test_frac=cfg["test_frac"],
+            seed=cfg["seed"],
+            label_keys=[args.label_key],
+        )
+        labels = stats_reload["test_labels"][args.label_key]
+        print(f"test cells={x_test.shape[0]}  cell-type levels ({args.label_key})={labels.nunique()}")
 
     # generation step: transport the prior to the model's whitened-PCA space
     n_gen = args.sample_n if args.sample_n > 0 else x_test.shape[0]
@@ -86,11 +102,16 @@ def main() -> None:
     prior = sample_prior(n_gen, shape=(cfg["dim"],), device=device)
     gen = midpoint_sample(model, prior.clone(), steps=args.sample_steps)
 
-    # model-space coords (whitened PCA) and their inverse to gene counts
+    # model-space coords (whitened PCA). The EB embedding has no recoverable gene
+    # counts, so we score EMD/MMD purely in PCA space (counts=None skips the
+    # gene-level diagnostics); the spatial slide additionally inverts to counts.
     gen_coords = gen.cpu().numpy()
     real_coords = x_test.numpy()
-    gen_counts = invert_pca_expression(gen_coords, stats)
-    real_counts = invert_pca_expression(real_coords, stats)
+    if is_eb:
+        gen_counts = real_counts = None
+    else:
+        gen_counts = invert_pca_expression(gen_coords, stats)
+        real_counts = invert_pca_expression(real_coords, stats)
 
     # EMD/MMD scored in PCA space (their way); gene metrics from the inverted counts
     metrics = run_evaluation(out, real_coords, gen_coords, real_counts, gen_counts,
@@ -99,7 +120,9 @@ def main() -> None:
     with open(out / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    if args.save_adata:
+    if args.save_adata and is_eb:
+        print("warning: --save_adata is not supported for the EB PCA embedding (no gene counts); skipping")
+    elif args.save_adata:
         try:
             import anndata as ad
             import pandas as pd

@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from tqdm import trange
 
-from fm.data import sample_prior, load_spatial_pca
+from fm.data import sample_prior, load_spatial_pca, load_eb_velocity
 from fm.flow_matching import conditional_flow_matching_loss, ot_conditional_flow_matching_loss
 from fm.interpolants import Interpolant
 from fm.networks import VelocityMLP
@@ -103,14 +103,26 @@ def main() -> None:
             ) from exc
         wandb_run = wandb.init(project="fm-spatial", config=vars(args) | {"device": str(device)})
 
-    train_loader, x_test, stats = load_spatial_pca(
-        args.data,
-        batch_size=args.batch,
-        n_pcs=args.n_pcs,
-        target_sum=args.target_sum,
-        test_frac=args.test_frac,
-        seed=args.seed,
-    )
+    # `.npz` -> Tong et al.'s EB data, which already ships a PCA embedding (no
+    # counts to normalize/PCA); `.h5ad` -> raw-count slide, normalize+log1p+PCA.
+    # Both return the same (train_loader, x_test, stats) so the loop is identical.
+    if args.data.endswith(".npz"):
+        train_loader, x_test, stats = load_eb_velocity(
+            args.data,
+            batch_size=args.batch,
+            n_pcs=args.n_pcs,
+            test_frac=args.test_frac,
+            seed=args.seed,
+        )
+    else:
+        train_loader, x_test, stats = load_spatial_pca(
+            args.data,
+            batch_size=args.batch,
+            n_pcs=args.n_pcs,
+            target_sum=args.target_sum,
+            test_frac=args.test_frac,
+            seed=args.seed,
+        )
     # model dim = whitened-PCA dimensionality (n_pcs, capped by data)
     pca_dim = x_test.shape[1]
     if resume_state is not None and args.dim != pca_dim:

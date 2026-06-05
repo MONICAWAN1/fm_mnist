@@ -233,6 +233,88 @@ def invert_pca_expression(x: np.ndarray, stats: dict) -> np.ndarray:
     return np.clip(np.expm1(ell), 0.0, None)
 
 
+def load_eb_velocity(
+    path: str,
+    batch_size: int,
+    n_pcs: int = 100,
+    whiten: bool = True,
+    embed_key: str = "pcs",
+    label_key: str = "sample_labels",
+    test_frac: float = 0.1,
+    seed: int = 0,
+    shuffle: bool = True,
+    label_keys: list[str] | None = None,
+) -> tuple[DataLoader, torch.Tensor, dict]:
+    """Load Tong et al.'s embryoid-body (EB) single-cell data from their `.npz`.
+
+    Same generative setup as `load_spatial_pca` — the flow transports N(0, I) onto
+    cell embeddings, and EMD/MMD are scored in that whitened-PCA space — but the EB
+    file already ships a precomputed PCA embedding, so there is no count matrix to
+    normalize/log1p/PCA. We consume `pcs[:, :n_pcs]` directly and only apply the
+    per-PC `StandardScaler` whitening, matching torchcfm's runner preprocessing for
+    this dataset (`time_dataset.tnet_dataset` -> `pcs`; `CustomTrajectoryDataModule`
+    with `max_dim=100, whiten=True`).
+
+    We pool all collection timepoints into one target distribution (this is a plain
+    generative fit, NOT the paper's leave-one-out trajectory task). The scaler is
+    fit on the TRAIN split only (no test leakage), and all cells are kept in PCA
+    space — there is no inverse to gene counts, so `stats` carries no `var_names`
+    (eval treats a missing `var_names` as "PCA-only": skip gene-level diagnostics).
+
+    `label_keys` is accepted for signature-compatibility with `load_spatial_pca`;
+    when truthy, `stats['test_labels']` is a one-column DataFrame of the integer
+    `sample_labels` (collection timepoint) for the test cells, used to colour the
+    UMAP.
+
+    Returns (train_loader, x_test, stats).
+    """
+    import pandas as pd
+    from sklearn.preprocessing import StandardScaler
+
+    npz = np.load(path, allow_pickle=True)
+    X = np.asarray(npz[embed_key], dtype=np.float32)
+    labels = np.asarray(npz[label_key])
+    k = int(min(n_pcs, X.shape[1]))
+    X = X[:, :k]
+
+    train_idx, test_idx = _split_indices(X.shape[0], test_frac, seed)
+    if whiten:
+        scaler = StandardScaler().fit(X[train_idx])  # fit on TRAIN only
+        sc_mean = scaler.mean_.astype(np.float32)
+        sc_scale = scaler.scale_.astype(np.float32)
+    else:
+        sc_mean = np.zeros(k, np.float32)
+        sc_scale = np.ones(k, np.float32)
+
+    def embed(rows: np.ndarray) -> np.ndarray:
+        return ((X[rows] - sc_mean) / sc_scale).astype(np.float32)
+
+    X_train, X_test = embed(train_idx), embed(test_idx)
+
+    stats = {
+        "space": "pca",
+        "n_pcs": k,
+        "whiten": whiten,
+        "sc_mean": sc_mean,    # un-whiten: x * sc_scale + sc_mean -> raw pcs
+        "sc_scale": sc_scale,
+        "seed": seed,
+        # no "var_names": signals to fm.eval that this is a PCA-only dataset
+    }
+    if label_keys is not None:
+        stats["test_labels"] = pd.DataFrame(
+            {label_key: labels[test_idx].astype(int)}
+        ).reset_index(drop=True)
+
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train)),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=True,
+        num_workers=0,
+    )
+    return train_loader, torch.from_numpy(X_test), stats
+
+
 def sample_gaussian_mixture(batch_size: int, device: str | torch.device = "cpu") -> torch.Tensor:
     """A simple multimodal p_data for visualizing transport."""
     centers = torch.tensor(
