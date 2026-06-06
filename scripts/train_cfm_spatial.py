@@ -29,7 +29,7 @@ from fm.networks import VelocityMLP
 # control the CLI is free to change.
 _RESUMABLE_CONFIG = (
     "data", "dim", "hidden", "batch", "lr", "interpolant",
-    "coupling", "ot_method", "test_frac", "target_sum", "n_pcs", "seed",
+    "coupling", "ot_method", "test_frac", "target_sum", "n_pcs", "whiten", "seed",
 )
 
 
@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--coupling", choices=["independent", "ot"], default="ot")
     p.add_argument("--ot_method", choices=["exact", "hungarian"], default="exact")
     p.add_argument("--test_frac", type=float, default=0.1)
+    p.add_argument("--no_whiten", dest="whiten", action="store_false", default=True)
     p.add_argument("--target_sum", type=float, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="outputs/cfm_spatial")
@@ -111,6 +112,7 @@ def main() -> None:
             args.data,
             batch_size=args.batch,
             n_pcs=args.n_pcs,
+            whiten=args.whiten,
             test_frac=args.test_frac,
             seed=args.seed,
         )
@@ -122,6 +124,7 @@ def main() -> None:
             target_sum=args.target_sum,
             test_frac=args.test_frac,
             seed=args.seed,
+            whiten=args.whiten,
         )
     # model dim = whitened-PCA dimensionality (n_pcs, capped by data)
     pca_dim = x_test.shape[1]

@@ -148,6 +148,7 @@ def load_spatial_pca(
     test_frac: float = 0.1,
     seed: int = 0,
     shuffle: bool = True,
+    whiten: bool = True, 
     label_keys: list[str] | None = None,
 ) -> tuple[DataLoader, torch.Tensor, dict]:
     """Mirror torchcfm's paper single-cell preprocessing: PCA components + whiten.
@@ -192,20 +193,31 @@ def load_spatial_pca(
     k = int(min(n_pcs, L.shape[1], len(train_idx) - 1))
 
     pca = PCA(n_components=k, random_state=seed).fit(L[train_idx])
-    scaler = StandardScaler().fit(pca.transform(L[train_idx]))
+    if whiten:
+        # per-PC zero-mean / unit-variance on top of the PCA projection
+        scaler = StandardScaler().fit(pca.transform(L[train_idx]))
+        sc_mean, sc_scale = scaler.mean_, scaler.scale_
 
-    def embed(rows: np.ndarray) -> np.ndarray:
-        return scaler.transform(pca.transform(L[rows])).astype(np.float32)
+        def embed(rows: np.ndarray) -> np.ndarray:
+            return scaler.transform(pca.transform(L[rows])).astype(np.float32)
+    else:
+        # stop at the raw PCA scores; identity scaler stats keep invert_pca_expression
+        # (x * sc_scale + sc_mean) a no-op, so the inverse needs no whiten-aware branch
+        sc_mean, sc_scale = np.zeros(k, np.float32), np.ones(k, np.float32)
+
+        def embed(rows: np.ndarray) -> np.ndarray:
+            return pca.transform(L[rows]).astype(np.float32)
 
     X_train, X_test = embed(train_idx), embed(test_idx)
 
     stats = {
         "space": "pca",
         "n_pcs": k,
+        "whiten": whiten,
         "pca_components": pca.components_.astype(np.float32),  # (k, G)
         "pca_mean": pca.mean_.astype(np.float32),             # (G,)
-        "sc_mean": scaler.mean_.astype(np.float32),           # (k,)
-        "sc_scale": scaler.scale_.astype(np.float32),         # (k,)
+        "sc_mean": sc_mean.astype(np.float32),           # (k,)
+        "sc_scale": sc_scale.astype(np.float32),         # (k,)
         "target_sum": eff_target,
         "var_names": list(map(str, adata.var_names)),
     }
@@ -324,17 +336,13 @@ def load_eb_velocity_trajectory(
 ) -> tuple[list[torch.Tensor], dict]:
     """Load EB data for the paper's TRAJECTORY task (transport timepoint t -> t+1).
 
-    This is the leave-one-out interpolation benchmark, NOT the noise->data generative
-    fit in `load_eb_velocity`. It reproduces torchcfm's `CustomTrajectoryDataModule`
-    (config `runner/configs/datamodule/time_dist.yaml`):
+    This is the leave-one-out interpolation benchmark. It reproduces torchcfm's 
+    `CustomTrajectoryDataModule`(config `runner/configs/datamodule/time_dist.yaml`):
 
         pcs[:, :n_pcs]  ->  StandardScaler whiten (fit on ALL cells)  ->  split by timepoint
 
-    Crucially their trajectory config uses `max_dim=5, whiten=True`: the EMD lives in
-    a 5-D whitened PCA space, which is why their reported W1 is ~0.8 rather than the
-    ~11 you get pooling all 100 PCs. The scaler is fit on all cells (as they do,
-    before splitting), which only standardizes per-PC and leaks no cross-timepoint
-    structure.
+    Their trajectory config uses `max_dim=5, whiten=True`: the EMD lives in
+    a 5-D whitened PCA spac3
 
     `sample_labels` are integer collection timepoints; we return one whitened float32
     tensor per timepoint, ordered by sorted unique label, so the trajectory loss can

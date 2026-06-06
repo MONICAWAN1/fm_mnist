@@ -77,6 +77,7 @@ def main() -> None:
             _resolve_data_path(cfg["data"]),
             batch_size=cfg["batch"],
             n_pcs=cfg["n_pcs"],
+            whiten=cfg.get("whiten", True),
             test_frac=cfg["test_frac"],
             seed=cfg["seed"],
             label_keys=[eb_label_key],
@@ -92,6 +93,7 @@ def main() -> None:
             test_frac=cfg["test_frac"],
             seed=cfg["seed"],
             label_keys=[args.label_key],
+            whiten=cfg.get("whiten", True),
         )
         labels = stats_reload["test_labels"][args.label_key]
         print(f"test cells={x_test.shape[0]}  cell-type levels ({args.label_key})={labels.nunique()}")
